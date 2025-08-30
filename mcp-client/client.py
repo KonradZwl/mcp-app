@@ -2,16 +2,22 @@ import asyncio
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 import ollama
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL")
 
 session = None
 messages = []
 
+
 async def main():
     global session
     global messages
-    
+
     # Connect to MCP server using sse
-    async with sse_client("http://localhost:8050/sse") as (read_stream, write_stream):
+    async with sse_client(f"{MCP_SERVER_URL}/sse") as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as s:
             session = s
             await session.initialize()
@@ -19,8 +25,8 @@ async def main():
             # List available tools from mcp server
             tools_result = await session.list_tools()
 
-            # Dynamically create async Python wrapper functions
-            tool_functions = []
+            # Build a simple dispatcher instead of fragile closures
+            tool_functions = {}
 
             for tool_meta in tools_result.tools:
                 async def make_tool_call(meta=tool_meta, **kwargs):
@@ -28,8 +34,8 @@ async def main():
 
                 make_tool_call.__name__ = tool_meta.name
                 make_tool_call.__doc__ = tool_meta.description or "No description provided"
-                tool_functions.append(make_tool_call)
-            
+                tool_functions[tool_meta.name] = make_tool_call
+
             # Add system message once
             messages.append({
                 'role': 'system',
@@ -38,7 +44,7 @@ async def main():
                     "Do not add any extra explanation or commentary. For other questions, answer normally."
                 )
             })
-            
+
             while True:
                 query = input('Ask a question (or type "quit" to exit): ')
                 if query.strip().lower() == "quit":
@@ -46,14 +52,14 @@ async def main():
                     break
                 if not query:
                     continue
-                
+
                 messages.append({'role': 'user', 'content': query})
 
                 # Call local llm
                 response = ollama.chat(
                     model='qwen2.5:7b-instruct',
                     messages=messages,
-                    tools=tool_functions
+                    tools=list(tool_functions.values())
                 )
 
                 # Print response with tool calls
@@ -61,29 +67,37 @@ async def main():
                 for tool_call in response.message.tool_calls or []:
                     print(f" - {tool_call.function.name}: {tool_call.function.arguments}")
 
-                results = []
+                results_text = []
 
+                # Execute all tool calls sequentially
                 for tool_call in response.message.tool_calls or []:
                     func_name = tool_call.function.name
                     args = tool_call.function.arguments or {}
 
-                    # Find the async function wrapper
-                    func = next(f for f in tool_functions if f.__name__ == func_name)
-                    # Call the async function
-                    result = await func(**args)
-                    results.append(result)
-                
-                results_text = [
-                    r.content[0].text if r.content else ""
-                    for tool_call in response.message.tool_calls or []
-                    for r in [await next(f for f in tool_functions if f.__name__ == tool_call.function.name)(**(tool_call.function.arguments or {}))]
-                ]
+                    func = tool_functions.get(func_name)
+                    if func is None:
+                        print(f"Warning: tool {func_name} not found.")
+                        continue
+
+                    try:
+                        result = await func(**args)
+                        if result.content and result.content[0].text:
+                            results_text.append(result.content[0].text)
+                    except Exception as e:
+                        print(f"Error calling tool {func_name}: {e}")
 
                 # If multiple results, combine them
                 combined_results = "\n".join(results_text)
-                print(combined_results)
-                messages.append({'role': 'tool', 'name': 'get_weatherforecast', 'content': combined_results})
-                
+                if combined_results:
+                    print(combined_results)
+                    # Append using the *actual tool name* if only one tool was called, else generic
+                    tool_role_name = (
+                        response.message.tool_calls[0].function.name
+                        if len(response.message.tool_calls or []) == 1
+                        else "multiple_tools"
+                    )
+                    messages.append({'role': 'tool', 'name': tool_role_name, 'content': combined_results})
+
                 # Feed back to Ollama
                 followup = ollama.chat(
                     model='qwen2.5:7b-instruct',
